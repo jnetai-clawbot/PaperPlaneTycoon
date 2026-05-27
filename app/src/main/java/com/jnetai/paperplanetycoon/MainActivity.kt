@@ -53,8 +53,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         scoreText = TextView(this).apply {
-            text = "Depth: 0m"
-            setTextColor(0xFF00FF88.toInt())
+            text = "Pull back to launch!"
+            setTextColor(0xFFFF9933.toInt())
             textSize = 18f
             setPadding(32, 32, 32, 8)
             typeface = Typeface.MONOSPACE
@@ -103,9 +103,9 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
     }
 
-    private fun updateScore(depth: Int) {
+    private fun updateScore(score: Int, phase: String) {
         runOnUiThread {
-            scoreText.text = "Depth: ${depth}m"
+            scoreText.text = "Score: $score  |  $phase"
         }
     }
 
@@ -216,100 +216,76 @@ class MainActivity : AppCompatActivity() {
     }
 }
 
-class GameView(context: Context, private val scoreCallback: (Int) -> Unit) : View(context) {
+class GameView(context: Context, private val scoreCallback: (Int, String) -> Unit) : View(context) {
     companion object {
-        const val TILE_SIZE = 60f
-        const val CAVE_WIDTH = 20
-        const val SONAR_RADIUS = 180f
-        const val BLAST_RADIUS = 120f
+        const val GRAVITY = 0.15f
+        const val LIFT = 0.06f
+        const val DRAG = 0.98f
         const val TAG = "GameView"
+        const val GROUND_Y = 0.85f
+        const val PLANE_RADIUS = 16f
     }
 
-    private val cave = Array(200) { BooleanArray(CAVE_WIDTH) }
-    private val revealed = Array(200) { BooleanArray(CAVE_WIDTH) }
-    private val enemies = mutableListOf<Enemy>()
-    private var playerX = CAVE_WIDTH / 2f
-    private var playerY = 15f
-    private var currentDepth = 0
-    private var gameOver = false
-    private var sonarPings = mutableListOf<SonarPing>()
-    private var directionalBlast: DirectionalBlast? = null
-    private var longPressActive = false
-    private var longPressX = 0f
-    private var longPressY = 0f
-    private val random = Random()
+    private enum class Phase { FOLDING, FLYING, CRASHED }
 
-    private val wallPaint = Paint().apply { color = 0xFF1A2A3A.toInt(); style = Paint.Style.FILL }
-    private val wallRevealedPaint = Paint().apply { color = 0xFF234A6A.toInt(); style = Paint.Style.FILL }
+    private var phase = Phase.FOLDING
+    private var planeX = 0f
+    private var planeY = 0f
+    private var velocityX = 0f
+    private var velocityY = 0f
+    private var planeAngle = 0f
+    private var score = 0
+    private var distanceTraveled = 0f
+    private var lastX = 0f
+    private var trickCombo = 0
+    private var trickText = ""
+    private var trickTextTimer = 0
+    private var gameOver = false
+
+    private var swipeStartX = 0f
+    private var swipeStartY = 0f
+    private var swipeActive = false
+    private var launchAngle = 0f
+    private var launchPower = 0f
+
+    private val obstacles = mutableListOf<Obstacle>()
+    private val trailPoints = mutableListOf<Pair<Float, Float>>()
+    private val random = Random()
+    private var scrollOffset = 0f
+    private var lastScoredX = 0f
+
     private val bgPaint = Paint().apply { color = 0xFF0A0A1A.toInt(); style = Paint.Style.FILL }
-    private val sonarPaint = Paint().apply { color = 0x3300FF88.toInt(); style = Paint.Style.FILL }
-    private val enemyPaint = Paint().apply { color = 0xFFFF3344.toInt(); style = Paint.Style.FILL }
-    private val enemyStunnedPaint = Paint().apply { color = 0xFF886622.toInt(); style = Paint.Style.FILL }
-    private val playerPaint = Paint().apply { color = 0xFF00CCFF.toInt(); style = Paint.Style.FILL }
-    private val playerGlowPaint = Paint().apply { color = 0x3300CCFF.toInt(); style = Paint.Style.FILL }
-    private val blastPaint = Paint().apply { color = 0x6600FF88.toInt(); style = Paint.Style.FILL }
-    private val pathPaint = Paint().apply { color = 0xFFFF8800.toInt(); style = Paint.Style.STROKE; strokeWidth = 2f; pathEffect = DashPathEffect(floatArrayOf(8f, 8f), 0f) }
-    private val clearPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) }
+    private val floorPaint = Paint().apply { color = 0xFF2A2A3A.toInt(); style = Paint.Style.FILL }
+    private val carpetPaint = Paint().apply { color = 0xFF1A1520.toInt(); style = Paint.Style.FILL }
+    private val deskPaint = Paint().apply { color = 0xFF3A3020.toInt(); style = Paint.Style.FILL }
+    private val windowPaint = Paint().apply { color = 0xFF334466.toInt(); style = Paint.Style.FILL }
+    private val windowGlowPaint = Paint().apply { color = 0x22336699.toInt(); style = Paint.Style.FILL }
+    private val fanPaint = Paint().apply { color = 0xFF555555.toInt(); style = Paint.Style.STROKE; strokeWidth = 3f }
+    private val fanBladePaint = Paint().apply { color = 0x66555555.toInt(); style = Paint.Style.FILL }
+    private val planePaint = Paint().apply { color = 0xFFFF9933.toInt(); style = Paint.Style.FILL }
+    private val planeWingPaint = Paint().apply { color = 0xFFFFCC66.toInt(); style = Paint.Style.FILL }
+    private val trailPaint = Paint().apply { color = 0x44FF9933.toInt(); style = Paint.Style.STROKE; strokeWidth = 3f }
+    private val aimLinePaint = Paint().apply { color = 0x88FF9933.toInt(); style = Paint.Style.STROKE; strokeWidth = 2f }
+    private val aimDotPaint = Paint().apply { color = 0xFFFF9933.toInt(); style = Paint.Style.FILL }
+    private val obstacleHitboxPaint = Paint().apply { color = 0xFFFF3344.toInt(); style = Paint.Style.FILL }
 
     init {
-        generateCave()
-        startSonarReveal()
+        planeX = 0.1f
+        planeY = GROUND_Y
+        generateObstacles()
+        post(gameLoop)
     }
 
-    private fun generateCave() {
-        for (y in 0 until 200) {
-            for (x in 0 until CAVE_WIDTH) {
-                cave[y][x] = true
-            }
-        }
-        var cx = CAVE_WIDTH / 2f
-        var cy = 0f
-        while (cy < 190) {
-            val r = 1.5f + random.nextFloat() * 3f
-            for (y in max(0f, cy - r).toInt()..min(199f, cy + r).toInt()) {
-                for (x in max(0f, cx - r).toInt()..min((CAVE_WIDTH - 1).toFloat(), cx + r).toInt()) {
-                    cave[y][x] = false
-                }
-            }
-            cx += (random.nextFloat() - 0.5f) * 2.5f
-            cx = cx.coerceIn(1.5f, CAVE_WIDTH - 2.5f)
-            cy += 1f + random.nextFloat() * 2f
-        }
-        for (y in 0..3) {
-            for (x in (CAVE_WIDTH / 2 - 2)..(CAVE_WIDTH / 2 + 2)) {
-                cave[y][x] = false
-            }
-        }
-        for (i in 0 until 15) {
-            val ey = 30 + random.nextInt(170)
-            val ex = random.nextInt(CAVE_WIDTH)
-            if (!cave[ey][ex]) {
-                enemies.add(Enemy(ex.toFloat(), ey.toFloat()))
-            }
-        }
-    }
-
-    private fun startSonarReveal() {
-        postDelayed({
-            if (!gameOver) {
-                sonarPings.add(SonarPing(playerX, playerY, SONAR_RADIUS * 0.25f, 500))
-                startSonarReveal()
-            }
-        }, 2000)
-    }
-
-    private fun revealArea(cx: Float, cy: Float, radius: Float) {
-        val tileR = radius / TILE_SIZE
-        val minX = ((cx - tileR).toInt().coerceAtLeast(0))
-        val maxX = ((cx + tileR).toInt().coerceAtMost(CAVE_WIDTH - 1))
-        val minY = ((cy - tileR).toInt().coerceAtLeast(0))
-        val maxY = ((cy + tileR).toInt().coerceAtMost(199))
-        for (y in minY..maxY) {
-            for (x in minX..maxX) {
-                val dist = sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy))
-                if (dist <= tileR) {
-                    revealed[y][x] = true
-                }
+    private fun generateObstacles() {
+        obstacles.clear()
+        for (i in 0 until 8) {
+            val ox = 0.3f + random.nextFloat() * 5.0f
+            val t = random.nextInt(4)
+            when (t) {
+                0 -> obstacles.add(Obstacle(ox, 0.08f, 40f, 60f, "ceiling_fan"))
+                1 -> obstacles.add(Obstacle(ox, 0.70f, 30f, 80f, "desk"))
+                2 -> obstacles.add(Obstacle(ox, 0.55f, 60f, 12f, "desk_edge"))
+                3 -> obstacles.add(Obstacle(ox, 0.12f, 50f, 70f, "window"))
             }
         }
     }
@@ -321,54 +297,31 @@ class GameView(context: Context, private val scoreCallback: (Int) -> Unit) : Vie
         }
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                longPressActive = true
-                longPressX = event.x
-                longPressY = event.y
-                postDelayed({
-                    if (longPressActive) {
-                        sonarPings.add(SonarPing(playerX, playerY, SONAR_RADIUS, 1200))
-                        val dx = longPressX - width / 2f
-                        val dy = longPressY - height / 2f
-                        val angle = atan2(dy.toDouble(), dx.toDouble()).toFloat()
-                        sonarPings.add(SonarPing(
-                            playerX + cos(angle) * 1.5f,
-                            playerY + sin(angle) * 1.5f,
-                            BLAST_RADIUS,
-                            600
-                        ))
-                        val blast = DirectionalBlast(playerX, playerY, angle, BLAST_RADIUS)
-                        directionalBlast = blast
-                        for (enemy in enemies) {
-                            if (enemy.stunned <= 0) {
-                                val edx = enemy.x - playerX
-                                val edy = enemy.y - playerY
-                                val dist = sqrt(edx * edx + edy * edy)
-                                val enemyAngle = atan2(edy.toDouble(), edx.toDouble()).toFloat()
-                                val angleDiff = abs(((angle - enemyAngle + PI * 3) % (PI * 2) - PI).toFloat())
-                                if (dist < BLAST_RADIUS / TILE_SIZE && angleDiff < PI / 4f) {
-                                    enemy.stunned = 5000
-                                }
-                            }
-                        }
-                    }
-                }, 600)
+                if (phase == Phase.FOLDING) {
+                    swipeStartX = event.x
+                    swipeStartY = event.y
+                    swipeActive = true
+                }
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (swipeActive && phase == Phase.FOLDING) {
+                    val dx = event.x - swipeStartX
+                    val dy = event.y - swipeStartY
+                    launchPower = sqrt(dx * dx + dy * dy).coerceAtMost(300f) / 300f
+                    launchAngle = atan2(dy.toDouble(), (-dx).toDouble()).toFloat()
+                }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                longPressActive = false
-                removeCallbacks(null)
-                if (event.eventTime - event.downTime < 400) {
-                    sonarPings.add(SonarPing(playerX, playerY, SONAR_RADIUS, 1000))
-                    for (enemy in enemies) {
-                        if (enemy.stunned <= 0) {
-                            val dx = enemy.x - playerX
-                            val dy = enemy.y - playerY
-                            val dist = sqrt(dx * dx + dy * dy)
-                            if (dist < SONAR_RADIUS / TILE_SIZE * 0.8f) {
-                                enemy.speed = minOf(enemy.speed * 1.3f, 0.05f)
-                            }
-                        }
-                    }
+                if (swipeActive && phase == Phase.FOLDING && launchPower > 0.1f) {
+                    velocityX = cos(launchAngle) * launchPower * 18f
+                    velocityY = sin(launchAngle) * launchPower * 18f
+                    phase = Phase.FLYING
+                    lastX = planeX
+                    lastScoredX = planeX
+                    score = 0
+                    trailPoints.clear()
                 }
+                swipeActive = false
             }
         }
         return true
@@ -383,185 +336,248 @@ class GameView(context: Context, private val scoreCallback: (Int) -> Unit) : Vie
         }
     }
 
-    init {
-        post(gameLoop)
-    }
-
     private fun update() {
-        playerY += 0.03f
-        if (playerY.toInt() % 10 == 0 && playerY.toInt() != currentDepth) {
-            currentDepth = playerY.toInt()
-            scoreCallback(currentDepth)
-        }
-        if (playerY.toInt() in cave.indices) {
-            val px = playerX.toInt().coerceIn(0, CAVE_WIDTH - 1)
-            if (cave[playerY.toInt()][px]) {
-                gameOver = true
-            }
-        }
-        if (playerY >= 199f) {
-            gameOver = true
-        }
+        if (phase == Phase.FLYING) {
+            velocityY += GRAVITY
+            velocityY -= LIFT * (0.5f + planeAngle.coerceIn(-0.5f, 0.5f))
+            velocityX *= DRAG
+            velocityY *= DRAG
 
-        val iter = enemies.iterator()
-        while (iter.hasNext()) {
-            val e = iter.next()
-            if (e.stunned > 0) {
-                e.stunned -= 33
-                continue
+            val speed = sqrt(velocityX * velocityX + velocityY * velocityY)
+            if (speed > 0.5f) {
+                planeAngle = (planeAngle * 0.9f + velocityY / speed * 0.1f).coerceIn(-1f, 1f)
             }
-            val dx = playerX - e.x
-            val dy = playerY - e.y
-            val dist = sqrt(dx * dx + dy * dy)
-            if (dist < 0.6f) {
+
+            planeX += velocityX * 0.016f
+            planeY += velocityY * 0.016f
+
+            distanceTraveled += (planeX - lastX).absoluteValue
+            lastX = planeX
+
+            val dx = planeX - lastScoredX
+            if (dx > 0.2f) {
+                score += (dx * 100).toInt()
+                lastScoredX = planeX
+            }
+
+            val prevCombo = trickCombo
+            if (velocityY < -4f && velocityX > 1f) trickCombo = maxOf(trickCombo, 1)
+            if (speed > 6f && abs(planeAngle) > 0.6f) trickCombo = maxOf(trickCombo, 2)
+            if (trickCombo > prevCombo) {
+                val tricks = listOf("Loop!", "Barrel Roll!", "Nose Dive!", "Glide!")
+                trickText = tricks[trickCombo - 1]
+                trickTextTimer = 60
+                score += trickCombo * 250
+            }
+
+            if (trickCombo >= 1 && speed < 3f && abs(planeAngle) < 0.2f) trickCombo = 0
+            if (trickTextTimer > 0) trickTextTimer--
+
+            if (planeY > GROUND_Y) {
+                phase = Phase.CRASHED
                 gameOver = true
+                scoreCallback(score, "Crashed!")
                 return
             }
-            if (dist > 0.2f) {
-                e.x += (dx / dist * e.speed).toFloat()
-                e.y += (dy / dist * e.speed * 0.5f).toFloat()
+            if (planeY < -1.5f) {
+                phase = Phase.CRASHED
+                gameOver = true
+                scoreCallback(score, "Too high!")
+                return
             }
-            e.x = e.x.coerceIn(0f, CAVE_WIDTH - 1f)
-            e.y = e.y.coerceIn(0f, 199f)
-        }
 
-        val pingIter = sonarPings.iterator()
-        while (pingIter.hasNext()) {
-            val p = pingIter.next()
-            val maxDist = p.radius / TILE_SIZE
-            val progress = p.lerp()
-            val currentRadius = maxDist * progress
-            revealArea(p.x, p.y, currentRadius)
-            if (progress >= 1f && p.elapsed > p.duration) {
-                pingIter.remove()
+            val vw = width.toFloat()
+            val vh = height.toFloat()
+            for (obs in obstacles) {
+                val ox = (obs.x - scrollOffset) * vw
+                val oy = obs.y * vh
+                val ow = obs.w
+                val oh = obs.h
+                val px = planeX * vw - scrollOffset * vw
+                val py = planeY * vh
+
+                if (obs.type == "ceiling_fan") {
+                    val fc = ox + ow / 2
+                    val fcy = oy + oh / 2
+                    val tipAngle = System.currentTimeMillis() % 3000 / 3000f * PI.toFloat() * 2f
+
+                    for (b in 0 until 3) {
+                        val ba = tipAngle + b * 2f * PI.toFloat() / 3f
+                        val bx = fc + cos(ba) * ow * 0.35f
+                        val by = fcy + sin(ba) * ow * 0.35f
+                        if (abs(px - bx) < ow * 0.15f && abs(py - by) < ow * 0.15f) {
+                            phase = Phase.CRASHED
+                            gameOver = true
+                            scoreCallback(score, "Hit the fan!")
+                            return
+                        }
+                    }
+                } else {
+                    if (px > ox - ow / 2 && px < ox + ow / 2 && py > oy - oh / 2 && py < oy + oh / 2) {
+                        if (obs.type == "window") {
+                            score += 500
+                            trickText = "Window Pass!"
+                            trickTextTimer = 60
+                        } else {
+                            phase = Phase.CRASHED
+                            gameOver = true
+                            scoreCallback(score, "Hit obstacle!")
+                            return
+                        }
+                    }
+                }
             }
-            p.elapsed += 33
-        }
 
-        directionalBlast?.let {
-            it.elapsed += 33
-            if (it.elapsed > 600) directionalBlast = null
+            trailPoints.add(planeX to planeY)
+            if (trailPoints.size > 60) trailPoints.removeAt(0)
+
+            scrollOffset += velocityX * 0.008f
+            val phaseStr = if (trickTextTimer > 0) trickText else "Flying"
+            scoreCallback(score, phaseStr)
         }
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
+        val vw = width.toFloat()
+        val vh = height.toFloat()
 
-        val viewHeight = height.toFloat()
-        val viewWidth = width.toFloat()
-        val offsetX = (viewWidth - CAVE_WIDTH * TILE_SIZE) / 2f
-        val viewCenterY = viewHeight / 2f
-        val offsetY = viewCenterY - playerY * TILE_SIZE
+        canvas.drawRect(0f, 0f, vw, vh, bgPaint)
 
-        val yTilesVisible = (viewHeight / TILE_SIZE).toInt() + 2
-        val startY = max(0, playerY.toInt() - yTilesVisible / 2)
-        val endY = min(199, startY + yTilesVisible)
+        val carpetRect = RectF(0f, vh * 0.82f, vw, vh.toFloat())
+        canvas.drawRect(carpetRect, carpetPaint)
 
-        for (y in startY..endY) {
-            for (x in 0 until CAVE_WIDTH) {
-                if (revealed[y][x]) {
-                    if (cave[y][x]) {
-                        canvas.drawRect(
-                            offsetX + x * TILE_SIZE,
-                            offsetY + y * TILE_SIZE,
-                            offsetX + (x + 1) * TILE_SIZE - 1,
-                            offsetY + (y + 1) * TILE_SIZE - 1,
-                            wallRevealedPaint
-                        )
+        val floorY = GROUND_Y * vh
+        canvas.drawRect(0f, floorY - 4f, vw, floorY + 4f, floorPaint)
+
+        for (obs in obstacles) {
+            val ox = (obs.x - scrollOffset) * vw
+            val oy = obs.y * vh
+
+            when (obs.type) {
+                "ceiling_fan" -> {
+                    val cx = ox + obs.w / 2
+                    val cy = oy
+                    canvas.drawCircle(cx, cy, obs.w / 2, fanPaint)
+                    val tipAngle = System.currentTimeMillis() % 3000 / 3000f * PI.toFloat() * 2f
+                    for (b in 0 until 3) {
+                        val ba = tipAngle + b * 2f * PI.toFloat() / 3f
+                        val bx = cx + cos(ba) * obs.w * 0.35f
+                        val by = cy + sin(ba) * obs.w * 0.35f
+                        canvas.drawCircle(bx, by, obs.w * 0.1f, fanBladePaint)
                     }
-                } else {
-                    canvas.drawRect(
-                        offsetX + x * TILE_SIZE,
-                        offsetY + y * TILE_SIZE,
-                        offsetX + (x + 1) * TILE_SIZE - 1,
-                        offsetY + (y + 1) * TILE_SIZE - 1,
-                        bgPaint
-                    )
+                }
+                "desk" -> {
+                    canvas.drawRect(ox - obs.w / 2, oy - obs.h / 2, ox + obs.w / 2, oy + obs.h / 2, deskPaint)
+                }
+                "desk_edge" -> {
+                    canvas.drawRect(ox - obs.w / 2, oy, ox + obs.w / 2, oy + 6f, deskPaint)
+                }
+                "window" -> {
+                    val wr = RectF(ox - obs.w / 2, oy - obs.h / 2, ox + obs.w / 2, oy + obs.h / 2)
+                    canvas.drawRect(wr, windowPaint)
+                    canvas.drawRect(wr, windowGlowPaint)
                 }
             }
         }
 
-        for (e in enemies) {
-            if (revealed[e.y.toInt().coerceIn(0, 199)][e.x.toInt().coerceIn(0, CAVE_WIDTH - 1)]) {
-                val paint = if (e.stunned > 0) enemyStunnedPaint else enemyPaint
-                canvas.drawCircle(
-                    offsetX + e.x * TILE_SIZE,
-                    offsetY + e.y * TILE_SIZE,
-                    TILE_SIZE * 0.35f,
-                    paint
-                )
-            }
+        val scrollPx = scrollOffset * vw
+
+        for (tp in trailPoints) {
+            val tx = tp.first * vw - scrollPx
+            val ty = tp.second * vh
+            canvas.drawCircle(tx, ty, 3f, trailPaint)
         }
 
-        val px = offsetX + playerX * TILE_SIZE
-        val py = offsetY + playerY * TILE_SIZE
-        canvas.drawCircle(px, py, TILE_SIZE * 0.35f, playerGlowPaint)
-        canvas.drawCircle(px, py, TILE_SIZE * 0.25f, playerPaint)
+        val px = planeX * vw - scrollPx
+        val py = planeY * vh
 
-        directionalBlast?.let { blast ->
-            val progress = blast.elapsed / 600f
-            val angle = blast.angle
-            val rad = blast.radius * (1f - progress)
-            val path = Path()
-            path.moveTo(px, py)
-            path.arcTo(
-                px - rad, py - rad, px + rad, py + rad,
-                Math.toDegrees((-angle + PI / 8).toDouble()).toFloat(),
-                45f * (1f - progress),
-                false
+        if (phase == Phase.FLYING || phase == Phase.CRASHED) {
+            canvas.save()
+            canvas.rotate(Math.toDegrees(planeAngle.toDouble()).toFloat(), px, py)
+
+            canvas.drawCircle(px - PLANE_RADIUS * 0.8f, py, PLANE_RADIUS * 0.35f, planePaint)
+            canvas.drawRoundRect(
+                px - PLANE_RADIUS * 0.3f, py - PLANE_RADIUS * 0.15f,
+                px + PLANE_RADIUS * 0.8f, py + PLANE_RADIUS * 0.15f,
+                4f, 4f, planePaint
             )
-            path.close()
-            canvas.drawPath(path, blastPaint)
+
+            val wingPath = Path().apply {
+                moveTo(px - PLANE_RADIUS * 0.2f, py + PLANE_RADIUS * 0.15f)
+                lineTo(px - PLANE_RADIUS * 0.3f, py + PLANE_RADIUS * 0.5f)
+                lineTo(px + PLANE_RADIUS * 0.0f, py + PLANE_RADIUS * 0.3f)
+                close()
+            }
+            canvas.drawPath(wingPath, planeWingPaint)
+
+            val wingPath2 = Path().apply {
+                moveTo(px - PLANE_RADIUS * 0.2f, py - PLANE_RADIUS * 0.15f)
+                lineTo(px - PLANE_RADIUS * 0.3f, py - PLANE_RADIUS * 0.5f)
+                lineTo(px + PLANE_RADIUS * 0.0f, py - PLANE_RADIUS * 0.3f)
+                close()
+            }
+            canvas.drawPath(wingPath2, planeWingPaint)
+
+            canvas.restore()
+        } else {
+            canvas.drawCircle(px, py, PLANE_RADIUS * 0.3f, planePaint)
+            canvas.drawRoundRect(
+                px - PLANE_RADIUS * 0.3f, py - PLANE_RADIUS * 0.12f,
+                px + PLANE_RADIUS * 0.7f, py + PLANE_RADIUS * 0.12f,
+                3f, 3f, planePaint
+            )
         }
 
-        for (ping in sonarPings) {
-            val cx = offsetX + ping.x * TILE_SIZE
-            val cy = offsetY + ping.y * TILE_SIZE
-            val maxDist = ping.radius
-            val currentR = maxDist * ping.lerp()
-            val alpha = ((1f - ping.lerp()) * 0.4).toInt()
-            sonarPaint.alpha = (alpha * 255).toInt()
-            canvas.drawCircle(cx, cy, currentR, sonarPaint)
+        if (swipeActive && phase == Phase.FOLDING) {
+            val lx = px + cos(launchAngle) * launchPower * 200f
+            val ly = py + sin(launchAngle) * launchPower * 200f
+            canvas.drawLine(px, py, lx, ly, aimLinePaint)
+            canvas.drawCircle(lx, ly, 8f, aimDotPaint)
         }
 
         if (gameOver) {
             val overlay = Paint().apply { color = 0xBB000000.toInt(); style = Paint.Style.FILL }
-            canvas.drawRect(0f, 0f, viewWidth, viewHeight, overlay)
+            canvas.drawRect(0f, 0f, vw, vh, overlay)
             val textPaint = Paint().apply {
                 color = 0xFFFF3344.toInt()
                 textSize = 48f
                 textAlign = Paint.Align.CENTER
                 typeface = Typeface.DEFAULT_BOLD
             }
-            val depthText = "Game Over"
-            canvas.drawText(depthText, viewWidth / 2f, viewHeight / 2f - 24, textPaint)
-            textPaint.textSize = 28f
+            canvas.drawText("Game Over", vw / 2f, vh / 2f - 24, textPaint)
+            textPaint.color = 0xFFFF9933.toInt()
+            textPaint.textSize = 32f
+            canvas.drawText("Score: $score", vw / 2f, vh / 2f + 32, textPaint)
+            textPaint.textSize = 22f
             textPaint.color = 0xFFCCCCCC.toInt()
-            val restartText = "Tap to Restart"
-            canvas.drawText(restartText, viewWidth / 2f, viewHeight / 2f + 32, textPaint)
+            canvas.drawText("Tap to Restart", vw / 2f, vh / 2f + 72, textPaint)
         }
     }
 
     fun restart() {
-        revealed.forEach { it.fill(false) }
-        enemies.clear()
-        generateCave()
-        playerX = CAVE_WIDTH / 2f
-        playerY = 15f
-        currentDepth = 0
+        phase = Phase.FOLDING
+        planeX = 0.1f
+        planeY = GROUND_Y
+        velocityX = 0f
+        velocityY = 0f
+        planeAngle = 0f
+        score = 0
+        distanceTraveled = 0f
+        lastX = 0.1f
+        lastScoredX = 0.1f
+        scrollOffset = 0f
+        trickCombo = 0
+        trickText = ""
+        trickTextTimer = 0
+        swipeActive = false
+        launchAngle = 0f
+        launchPower = 0f
         gameOver = false
-        sonarPings.clear()
-        directionalBlast = null
-        scoreCallback(0)
+        trailPoints.clear()
+        scoreCallback(0, "Ready")
         invalidate()
     }
 }
 
-data class Enemy(var x: Float, var y: Float, var speed: Float = 0.025f, var stunned: Int = 0)
-
-data class SonarPing(val x: Float, val y: Float, val radius: Float, val duration: Int, var elapsed: Int = 0) {
-    fun lerp(): Float = (elapsed.toFloat() / duration).coerceIn(0f, 1f)
-}
-
-data class DirectionalBlast(val x: Float, val y: Float, val angle: Float, val radius: Float, var elapsed: Int = 0)
+data class Obstacle(val x: Float, val y: Float, val w: Float, val h: Float, val type: String)
